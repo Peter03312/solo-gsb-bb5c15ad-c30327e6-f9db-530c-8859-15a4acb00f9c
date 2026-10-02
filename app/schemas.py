@@ -289,6 +289,40 @@ class CommitmentIssueRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+class ExemptionPreviewRequest(BaseModel):
+    """最小区域豁免预演请求：相对秒数固定行程 + 带时区候选出发窗口 +
+    可豁免的互异现有区域编号 + 客户端已读的区域 revision。
+
+    轨迹与窗口语义与 /api/schedule 相同（首点相对秒数为 0、其余严格递增；
+    窗口左闭右开）。预演为只读计算：不修改任何数据，也不推进 revision。
+    """
+
+    points: list[RelativePointIn] = Field(min_length=2)
+    window_start: datetime = Field(description="候选出发窗口起点（含，带时区）")
+    window_end: datetime = Field(description="候选出发窗口终点（不含，带时区）")
+    candidate_region_ids: list[int] = Field(
+        description="可豁免的现有区域编号（必须互异；空列表表示不允许豁免任何区域）"
+    )
+    expected_revision: int = Field(ge=0, description="客户端已读的区域集合 revision")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _check_time(cls, v: datetime, info):
+        return _require_utc(v, info.field_name)
+
+    @field_validator("candidate_region_ids", mode="before")
+    @classmethod
+    def _check_ids(cls, v):
+        if not isinstance(v, list):
+            return v  # 非数组交由 pydantic 报类型错误
+        for rid in v:
+            if isinstance(rid, bool) or not isinstance(rid, int) or rid < 1:
+                raise ValueError("可豁免区域编号必须为正整数")
+        return v
+
+
 # ---------------------------------------------------------------- 响应模型
 
 def _iso_z(dt: datetime) -> str:
@@ -349,6 +383,26 @@ class ScheduleResponse(_UTCDatetimeModel):
     revision: int
     window_start: datetime
     window_end: datetime
+    intervals: list[DepartureIntervalOut]
+
+
+class ExemptionPreviewResponse(_UTCDatetimeModel):
+    """最小区域豁免预演结果。
+
+    feasible=false 表示即使豁免全部候选区域，窗口内仍不存在安全出发时刻，
+    此时 exempted_region_ids/earliest_departure 为 null、intervals 为空；
+    feasible=true 时 exempted_region_ids 为最优方案的豁免编号（升序，
+    原本安全则为空列表），earliest_departure 为该方案下最早安全出发时刻，
+    intervals 为该方案的完整安全出发区间（左闭右开）。
+    revision 为本次预演所依据的已提交区域快照版本。
+    """
+
+    feasible: bool
+    revision: int
+    window_start: datetime
+    window_end: datetime
+    exempted_region_ids: list[int] | None
+    earliest_departure: datetime | None
     intervals: list[DepartureIntervalOut]
 
 

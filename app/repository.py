@@ -107,6 +107,31 @@ class IdempotencyKeyConflict(Exception):
         self.key = key
 
 
+class ExemptionRevisionConflict(Exception):
+    """豁免预演：expected_revision 与库内当前 revision 不符。"""
+
+    def __init__(self, expected: int, current: int):
+        super().__init__(f"revision 已过期：expected={expected}, current={current}")
+        self.expected = expected
+        self.current = current
+
+
+class ExemptionRegionsNotFound(Exception):
+    """豁免预演：候选豁免编号引用了不存在的区域。"""
+
+    def __init__(self, missing: list[int]):
+        super().__init__("候选豁免编号包含不存在的区域")
+        self.missing = missing
+
+
+class ExemptionDuplicateRegions(Exception):
+    """豁免预演：候选豁免编号存在重复。"""
+
+    def __init__(self, duplicates: list[int]):
+        super().__init__("候选豁免编号存在重复")
+        self.duplicates = duplicates
+
+
 def _row_to_region(row: dict) -> dict:
     return {
         "id": row["id"],

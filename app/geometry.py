@@ -402,6 +402,21 @@ def contact_intervals_relative(
     return [(iv.start, iv.end) for iv in merged]
 
 
+def _region_forbidden_departures(
+    traj: list[tuple[float, float, float]], region: dict
+) -> list[tuple[float, float]]:
+    """单个区域导致的禁止出发时刻集合（左闭右开，已合并）。"""
+    vf = region["valid_from"]
+    vt = region["valid_to"]
+    raw: list[EpochInterval] = []
+    for a, b in contact_intervals_relative(traj, region["polygon"]):
+        lo, hi = vf - b, vt - a
+        if hi - lo > EPS:
+            raw.append(EpochInterval(lo, hi))
+    merged = merge_intervals(raw)
+    return [(iv.start, iv.end) for iv in merged]
+
+
 def forbidden_departure_intervals(
     traj: list[tuple[float, float, float]], regions: list[dict]
 ) -> list[tuple[float, float]]:
@@ -418,31 +433,26 @@ def forbidden_departure_intervals(
     """
     raw: list[EpochInterval] = []
     for region in regions:
-        vf = region["valid_from"]
-        vt = region["valid_to"]
-        for a, b in contact_intervals_relative(traj, region["polygon"]):
-            lo, hi = vf - b, vt - a
-            if hi - lo > EPS:
-                raw.append(EpochInterval(lo, hi))
+        raw.extend(
+            EpochInterval(lo, hi)
+            for lo, hi in _region_forbidden_departures(traj, region)
+        )
     merged = merge_intervals(raw)
     return [(iv.start, iv.end) for iv in merged]
 
 
-def safe_departure_intervals(
-    traj: list[tuple[float, float, float]],
-    regions: list[dict],
+def _subtract_forbidden(
+    forbidden: list[tuple[float, float]],
     window_start: float,
     window_end: float,
 ) -> list[dict]:
-    """在候选出发时段 [window_start, window_end) 内计算全部安全出发区间。
+    """候选窗口（左闭右开）扣除已合并的禁止区间（左闭右开），返回安全出发区间。
 
-    安全集合 = 候选窗口（左闭右开）减去禁止出发区间的并集（左闭右开）。
     结果按起点排序，端点均为「左闭右开」；无可行时返回 []。
     """
     if window_end <= window_start:
         return []
 
-    forbidden = forbidden_departure_intervals(traj, regions)
     safe: list[dict] = []
     cursor = window_start
     for lo, hi in forbidden:
@@ -471,3 +481,139 @@ def safe_departure_intervals(
             "end_inclusive": False,
         })
     return safe
+
+
+def safe_departure_intervals(
+    traj: list[tuple[float, float, float]],
+    regions: list[dict],
+    window_start: float,
+    window_end: float,
+) -> list[dict]:
+    """在候选出发时段 [window_start, window_end) 内计算全部安全出发区间。
+
+    安全集合 = 候选窗口（左闭右开）减去禁止出发区间的并集（左闭右开）。
+    结果按起点排序，端点均为「左闭右开」；无可行时返回 []。
+    """
+    if window_end <= window_start:
+        return []
+    return _subtract_forbidden(
+        forbidden_departure_intervals(traj, regions), window_start, window_end
+    )
+
+
+# ---------------------------------------------------------------- 最小区域豁免预演
+
+def minimal_exemption_plan(
+    traj: list[tuple[float, float, float]],
+    regions: list[dict],
+    candidate_ids: list[int],
+    window_start: float,
+    window_end: float,
+) -> dict:
+    """最小区域豁免预演：只在本次计算中忽略被选区域，找出使候选窗口内
+    至少存在一个安全出发时刻的豁免方案（纯函数，不产生任何副作用）。
+
+    方案选择顺序：豁免区域数最少 → 该方案下最早安全时刻最早 →
+    豁免编号升序序列字典序最小。原本安全时豁免集为空集；
+    豁免全部候选区域仍无安全时刻时不可行。
+
+    traj: [(t_seconds, x, y), ...]（相对秒数轨迹，已校验）；
+    regions: 同一已提交快照中的全部区域（几何 dict）；
+    candidate_ids: 可豁免区域编号（调用方保证互异且都存在于 regions）。
+
+    返回 {
+      "feasible": bool,
+      "exempted": [region_id, ...]（升序；不可行时为 None）,
+      "earliest": 该方案最早安全出发时刻 epoch 秒（不可行时为 None）,
+      "intervals": 该方案完整安全出发区间（与 safe_departure_intervals 同结构）,
+    }
+    """
+    candidate_set = set(candidate_ids)
+    # 逐区域禁止出发区间（与 /api/schedule 同一公式：[vf-b, vt-a)，左闭右开）
+    per_region: dict[int, list[tuple[float, float]]] = {
+        region["id"]: _region_forbidden_departures(traj, region)
+        for region in regions
+    }
+    # 不在候选中的区域任何方案都无法豁免，其禁止区间先从窗口扣除
+    base: list[tuple[float, float]] = []
+    for rid, ivs in per_region.items():
+        if rid not in candidate_set:
+            base.extend(ivs)
+    base_merged = [
+        (iv.start, iv.end)
+        for iv in merge_intervals([EpochInterval(s, e) for s, e in base])
+    ]
+    workable = _subtract_forbidden(base_merged, window_start, window_end)
+    if not workable:
+        # 不可豁免区域已覆盖整个窗口：豁免候选区域也无济于事
+        return {"feasible": False, "exempted": None, "earliest": None, "intervals": []}
+
+    cand_ids = sorted(candidate_set)
+    cand_forbidden = {rid: per_region.get(rid, []) for rid in cand_ids}
+
+    # 用全部区间端点把可工作窗口切成「等覆盖」基本段（半开）：
+    # 段内任意时刻被同一组候选区域禁止，豁免代价在段内为常数
+    bounds: set[float] = set()
+    for seg in workable:
+        bounds.add(seg["start"])
+        bounds.add(seg["end"])
+    for rid in cand_ids:
+        for lo, hi in cand_forbidden[rid]:
+            bounds.add(lo)
+            bounds.add(hi)
+    pts = sorted(bounds)
+
+    spans = [(seg["start"], seg["end"]) for seg in workable]
+    segments: list[tuple[float, float, frozenset]] = []
+    for a, b in zip(pts, pts[1:]):
+        if b - a <= EPS:
+            # 与安全区间引擎一致：宽度不超过 EPS 的碎段不产生安全时刻
+            continue
+        if not any(ws <= a < we for ws, we in spans):
+            continue
+        # 禁止区间左闭右开：段左端点的覆盖即整段覆盖
+        cover = frozenset(
+            rid
+            for rid in cand_ids
+            if any(lo <= a < hi for lo, hi in cand_forbidden[rid])
+        )
+        segments.append((a, b, cover))
+
+    if not segments:
+        return {"feasible": False, "exempted": None, "earliest": None, "intervals": []}
+
+    # 方案 S 可行 ⟺ 存在某基本段，其覆盖集 ⊆ S（该段即安全）；
+    # 最少豁免数 = 各基本段覆盖集的最小大小，达到该大小的可行方案
+    # 恰为最小覆盖集本身（|S|=k* 且覆盖集 ⊆ S ⟹ S 等于该覆盖集）
+    k_star = min(len(cover) for _, _, cover in segments)
+    plans = sorted(
+        {tuple(sorted(cover)) for _, _, cover in segments if len(cover) == k_star}
+    )
+
+    best: tuple[tuple[float, tuple], tuple, list[dict]] | None = None
+    for plan in plans:
+        plan_set = set(plan)
+        forbid = list(base_merged)
+        for rid in cand_ids:
+            if rid not in plan_set:
+                forbid.extend(cand_forbidden[rid])
+        merged = [
+            (iv.start, iv.end)
+            for iv in merge_intervals([EpochInterval(s, e) for s, e in forbid])
+        ]
+        intervals = _subtract_forbidden(merged, window_start, window_end)
+        if not intervals:
+            continue  # 覆盖论证保证不会发生；防御性跳过
+        key = (intervals[0]["start"], plan)
+        if best is None or key < best[0]:
+            best = (key, plan, intervals)
+
+    if best is None:
+        return {"feasible": False, "exempted": None, "earliest": None, "intervals": []}
+    (_, plan, intervals) = best
+    return {
+        "feasible": True,
+        "exempted": list(plan),
+        "earliest": intervals[0]["start"],
+        "intervals": intervals,
+    }

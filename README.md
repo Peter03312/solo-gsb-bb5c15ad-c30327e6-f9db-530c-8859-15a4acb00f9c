@@ -17,7 +17,12 @@
 编号、当前安全结论与区域 revision；单区及批量区域变更成功时，对未取消且
 末点未过的观察比较变更前后安全结论，**仅结论翻转**才在**同一事务**留一条
 含观察编号、旧/新结论与新 revision 的事件（整批至多一条/观察）；观察
-**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。**每次成功的区域集合变更**（单区登记/修订/删除与批量变更）还会在**同一事务**追加一条**只读审计记录**（revision、发生时间、变更类型、涉及区域编号与批量操作摘要），安全员可按全局 revision 游标升序分页读取。
+**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。安全员还可对
+**相对秒数固定行程 + 带时区候选出发窗口**做**最小区域豁免只读预演**：
+在给出的可豁免现有区域编号子集中求出让窗口内存在安全出发时刻的最小豁免
+方案（豁免数最少 → 该方案最早安全时刻最早 → 编号序列字典序取小），返回
+所据 revision、豁免编号、最早安全时刻与该方案的完整安全出发区间；预演不
+改变任何数据。**每次成功的区域集合变更**（单区登记/修订/删除与批量变更）还会在**同一事务**追加一条**只读审计记录**（revision、发生时间、变更类型、涉及区域编号与批量操作摘要），安全员可按全局 revision 游标升序分页读取。
 
 ## 核验规则
 
@@ -381,6 +386,106 @@ curl -X POST http://localhost:8000/api/regions \
   `REPEATABLE READ READ ONLY` 事务中完成，区域并发修订时本请求使用同一已提交
   快照。
 
+## 最小区域豁免预演规则（`POST /api/schedule/exemptions`）
+
+安全员为一条固定行程评估**最小区域豁免**：给定相对秒数轨迹、带时区候选
+出发窗口、**可豁免的互异现有区域编号**及**已读区域 revision**，系统
+**只在本次预演中**忽略被选中的区域（不删除、不修订任何区域），从可豁免
+区域的**子集**中找出使窗口内**至少存在一个安全出发时刻**的方案。
+
+* **请求**：与 `/api/schedule` 相同的 `points`（相对秒数，首点 `t=0`、
+  其余严格递增）与 `window_start/window_end`（左闭右开，可带任意时区，
+  归一化为 UTC），另给：
+  * `candidate_region_ids`：可豁免的现有区域编号，**非空数组、编号互异、
+    必须全部存在**；
+  * `expected_revision`：安全员已读的区域全局 revision。
+* **规则**：完全沿用既有调度运算——相邻点直线匀速、几何接触含边界
+  （边界接触即违规、单点接触为退化闭区间）、区域生效时段左闭右开
+  `[vf, vt)`，接触 `[a,b]` 对应禁止出发 `[vf-b, vt-a)`；不可豁免区域
+  （未出现在 `candidate_region_ids` 中的现有区域）的禁止区间照常生效。
+* **方案选优（依次比较）**：
+  1. **豁免区域数最少**；
+  2. 该方案下窗口内**最早安全出发时刻最早**；
+  3. 仍并列时，按豁免编号升序序列的**字典序**取小。
+  原本安全（空豁免即有安全时刻）时豁免集为 `[]`；几何上与行程不相交、
+  生效窗与窗口无禁止交集的候选区域不会被选入方案。
+* **成功响应（HTTP 200）**：
+
+  | 字段 | 说明 |
+  | --- | --- |
+  | `feasible` | 是否存在可行豁免方案 |
+  | `revision` | 本次预演所据的已提交区域 revision |
+  | `candidate_region_ids` | 回显可豁免编号（按请求顺序） |
+  | `exempt_region_ids` | 最优方案的豁免编号（升序）；不可行或原本安全时为 `[]` |
+  | `earliest_departure` | 该方案窗口内最早安全出发时刻（UTC ISO8601）；不可行为 `null` |
+  | `intervals` | 该方案的**完整**安全出发区间（左闭右开，结构同 `/api/schedule`）；不可行为 `[]` |
+
+  **无可行方案不是错误**：即使豁免全部候选区域，窗口内仍无安全时刻时
+  返回 **200** 且 `feasible=false`（明确的不可行结果）。
+* **拒绝（请求非法或过期）**：
+
+  | 状态码 | error.code | 触发条件 |
+  | --- | --- | --- |
+  | 409 | `revision_conflict` | `expected_revision` 与当前 revision 不符（details 带 `current_revision`） |
+  | 404 | `region_not_found` | `candidate_region_ids` 含不存在的编号（details 列出编号） |
+  | 422 | `duplicate_region` | `candidate_region_ids` 出现重复编号（details 带 `duplicate_region_ids`） |
+  | 422 | `invalid_trajectory` / `invalid_input` / `validation_error` | 轨迹非法、窗口倒序/不带时区、候选数组为空或编号 `<1`、缺字段等 |
+
+* **只读预演**：整个计算在单个 `REPEATABLE READ READ ONLY` 事务中使用
+  **同一已提交区域快照**完成；不推进 revision，不改变区域、通行凭证、
+  择时承诺、安全状态观察、观察事件、幂等键与审计历史，既有
+  `/api/verify`、`/api/schedule` 及其它核验/调度结果不受任何影响。
+
+```bash
+curl -X POST http://localhost:8000/api/schedule/exemptions \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "points": [
+          {"x": -50, "y": 50, "t": 0},
+          {"x": 150, "y": 50, "t": 60}
+        ],
+        "window_start": "2030-06-01T18:00:00+08:00",
+        "window_end":   "2030-06-01T20:00:00+08:00",
+        "candidate_region_ids": [3, 5],
+        "expected_revision": 7
+      }'
+```
+
+可行响应示例（豁免区域 3 后窗口内有两段安全区间）：
+
+```json
+{
+  "feasible": true,
+  "revision": 7,
+  "window_start": "2030-06-01T10:00:00Z",
+  "window_end": "2030-06-01T12:00:00Z",
+  "candidate_region_ids": [3, 5],
+  "exempt_region_ids": [3],
+  "earliest_departure": "2030-06-01T10:00:00Z",
+  "intervals": [
+    {"start": "2030-06-01T10:00:00Z", "end": "2030-06-01T10:59:45Z",
+     "start_inclusive": true, "end_inclusive": false},
+    {"start": "2030-06-01T11:30:00Z", "end": "2030-06-01T12:00:00Z",
+     "start_inclusive": true, "end_inclusive": false}
+  ]
+}
+```
+
+不可行响应示例（HTTP 200）：
+
+```json
+{
+  "feasible": false,
+  "revision": 7,
+  "window_start": "2030-06-01T10:00:00Z",
+  "window_end": "2030-06-01T12:00:00Z",
+  "candidate_region_ids": [3],
+  "exempt_region_ids": [],
+  "earliest_departure": null,
+  "intervals": []
+}
+```
+
 ## 技术栈
 
 Python 3.11 · FastAPI · PostgreSQL 16 · Shapely 2（GEOS）· psycopg3 · Uvicorn
@@ -452,6 +557,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/revision` | 当前区域集合全局版本号（任意写操作后单调 +1） |
 | POST | `/api/verify` | 对一条绝对时刻轨迹做整段穿越核验 |
 | POST | `/api/schedule` | 对一条相对秒数固定行程，求候选时段内全部安全出发区间 |
+| POST | `/api/schedule/exemptions` | 最小区域豁免只读预演：可豁免区域子集中求最小豁免方案与该方案完整安全区间 |
 | POST | `/api/passes` | 为一条绝对时刻轨迹签发可取消的通行凭证（201） |
 | GET | `/api/passes/{id}` | 按 ID 查询凭证（含状态） |
 | POST | `/api/passes/{id}/cancel` | 取消凭证（幂等），返回状态 |
@@ -914,14 +1020,49 @@ curl 'http://localhost:8000/api/observations/1/events?limit=100&cursor=0'
   区域生效窗口长度；接触恰落在 `valid_to` 的那次出发安全（右端开），
   落在 `valid_from` 的那次出发禁止（左端闭）。
 
+### 最小区域豁免预演 `POST /api/schedule/exemptions`
+
+在可豁免现有区域（`candidate_region_ids`，非空、互异、必须全部存在）的
+子集中，求出让候选窗口内存在安全出发时刻的最小豁免方案，另需携带
+`expected_revision`（已读 revision，过期返回 409）。请求的轨迹/窗口结构
+与 `/api/schedule` 完全相同；方案按「豁免数最少 → 最早安全时刻最早 →
+豁免编号升序序列字典序」选优。预演为**纯只读**（REPEATABLE READ READ
+ONLY 快照），不改变区域、revision、凭证、承诺、观察与审计。
+
+```json
+{
+  "points": [
+    {"x": -50, "y": 50, "t": 0},
+    {"x": 150, "y": 50, "t": 60}
+  ],
+  "window_start": "2030-06-01T18:00:00+08:00",
+  "window_end":   "2030-06-01T20:00:00+08:00",
+  "candidate_region_ids": [3, 5],
+  "expected_revision": 7
+}
+```
+
+可行时返回 200，含 `feasible=true`、所据 `revision`、`exempt_region_ids`
+（升序；原本安全时为 `[]`）、`earliest_departure` 与该方案的完整
+`intervals`（左闭右开）；即使豁免全部候选区域仍无安全时刻时返回 200 且
+`feasible=false`（明确的不可行结果，`intervals` 为空、
+`earliest_departure` 为 `null`）。编号未知返回 404 `region_not_found`、
+编号重复返回 422 `duplicate_region`、revision 过期返回 409
+`revision_conflict`，轨迹/窗口非法沿用 `invalid_trajectory`/
+`invalid_input`/`validation_error`。
+
 ### 错误响应
 
 统一使用 `422`（语义错误）、`404`（区域/凭证不存在）或 `409`（批量提交的
 revision 冲突、区域变更与未取消凭证冲突、幂等键冲突）。除通用的
 `validation_error` 外，
 轨迹类错误使用专用错误码：`/api/verify` 与 `/api/passes` 为
-`invalid_trajectory`，`/api/schedule` 的相对轨迹问题同样返回
-`invalid_trajectory`，候选时段不递增返回 `invalid_input`；
+`invalid_trajectory`，`/api/schedule` 与 `/api/schedule/exemptions` 的
+相对轨迹问题同样返回 `invalid_trajectory`，候选时段不递增返回
+`invalid_input`；
+`/api/schedule/exemptions` 另用 `revision_conflict`（409，已读 revision
+过期）、`region_not_found`（404，可豁免编号未知）、`duplicate_region`
+（422，可豁免编号重复）；
 `/api/regions/batch` 另用 `revision_conflict`（409）、`region_not_found`（404）、
 `duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）；
 凭证相关另用 `pass_conflict`（409，区域变更危及未取消凭证）与
@@ -973,6 +1114,10 @@ bash examples/curl_idempotency.sh
 # 不留记录；revision 游标升序分页、next_cursor、游标非法 422）
 bash examples/curl_region_changes.sh
 
+# 最小区域豁免只读预演（可行/原本安全空豁免/不可行/未知编号/重复编号/
+# revision 过期/轨迹窗口非法；预演只读，revision 与审计不变）
+bash examples/curl_exemptions.sh
+
 # 仅用 Python 标准库的调用示例（含调度两段安全区间与通行凭证演示）
 python3 examples/python_client.py
 ```
@@ -986,6 +1131,10 @@ python3 tests/test_geometry.py
 # 纯几何引擎：安全出发区间调度用例（精确端点、单点接触、沿边界、
 # 生效窗口端点、多区域并集等），不需要数据库
 python3 tests/test_schedule_geometry.py
+
+# 纯几何引擎：最小区域豁免预演用例（豁免数最少→最早时刻→字典序、
+# 不可豁免阻挡、单点接触/生效端点、完整安全区间等），不需要数据库
+python3 tests/test_exemptions_geometry.py
 
 # HTTP + PostgreSQL 集成测试（需要可连接的数据库，会清空 regions 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_api.py
@@ -1017,18 +1166,24 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 游标分页不重不漏、游标非法 422、并发写与查询期间新增不重不漏，
 # 会清空全部业务表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_region_changes_api.py
+
+# 最小区域豁免预演 API 集成测试（原本安全空豁免/最小豁免/不可行结果、
+# 未知编号 404、重复编号 422、revision 过期 409、轨迹窗口非法 422、
+# 时区归一化、预演只读不改 revision/区域/审计/既有调度核验，会清空全部业务表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_exemptions_api.py
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes、commitments、observations、区域变更审计历史、幂等键）
-  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、观察与事件分页模型、区域变更审计分页模型）
-  geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差）
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、最小区域豁免预演、batch、passes、commitments、observations、区域变更审计历史、幂等键）
+  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、观察与事件分页模型、区域变更审计分页模型、最小区域豁免预演模型）
+  geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差、逐区域禁止出发区间）
+  exemptions.py  # 最小区域豁免预演引擎（诱导集合枚举：豁免数最少→最早安全时刻→编号字典序，纯函数）
   repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证/择时承诺/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件与区域变更审计追加、幂等键占位/回放
   db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments/observations/observation_events/idempotency_keys/region_change_audit）、启动重试
-examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺、安全状态观察、区域集合变更审计历史与幂等重试）
-tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/安全状态观察/区域变更审计历史/幂等键集成测试
+examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺、安全状态观察、区域集合变更审计历史、最小区域豁免预演与幂等重试）
+tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/安全状态观察/区域变更审计历史/最小区域豁免预演/幂等键集成测试
 Dockerfile, docker-compose.yml
 ```

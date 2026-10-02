@@ -14,7 +14,7 @@ from psycopg.errors import CheckViolation
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import db, geometry, repository
+from . import db, exemptions, geometry, repository
 from .repository import (
     BatchDuplicateRegion,
     BatchInvalidOperation,
@@ -30,6 +30,8 @@ from .repository import (
 from .schemas import (
     CommitmentIssueRequest,
     CommitmentOut,
+    ExemptionPreviewRequest,
+    ExemptionPreviewResponse,
     ObservationEventPage,
     ObservationOut,
     ObservationRegisterRequest,
@@ -63,8 +65,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.7.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试。",
+    version="1.8.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；安全员可对相对秒数轨迹与带时区候选出发窗口做最小区域豁免只读预演（在可豁免现有区域子集中求最小豁免方案及该方案的完整安全出发区间）；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试。",
     lifespan=lifespan,
 )
 
@@ -86,6 +88,14 @@ class InvalidIdempotencyKey(Exception):
     def __init__(self, message: str):
         super().__init__(message)
         self.message = message
+
+
+class DuplicateExemptionRegion(Exception):
+    """最小区域豁免预演请求的可豁免区域编号出现重复（HTTP 422）。"""
+
+    def __init__(self, duplicates: list[int]):
+        super().__init__("可豁免区域编号不可重复")
+        self.duplicates = duplicates
 
 
 IDEMPOTENCY_KEY_MAX_LEN = 128
@@ -278,6 +288,19 @@ async def _on_invalid_idempotency_key(_request: Request, exc: InvalidIdempotency
         "invalid_idempotency_key",
         exc.message,
         [{"loc": ["header", "Idempotency-Key"], "message": exc.message}],
+    )
+
+
+@app.exception_handler(DuplicateExemptionRegion)
+async def _on_duplicate_exemption_region(_request: Request, exc: DuplicateExemptionRegion):
+    ids = sorted(exc.duplicates)
+    return _error_response(
+        422,
+        "duplicate_region",
+        str(exc),
+        [{"loc": ["candidate_region_ids"],
+          "message": f"可豁免区域编号不可重复，重复编号：{ids}",
+          "duplicate_region_ids": ids}],
     )
 
 
@@ -1224,6 +1247,116 @@ def schedule(payload: ScheduleRequest):
     )
 
 
+@app.post("/api/schedule/exemptions", response_model=ExemptionPreviewResponse,
+          tags=["scheduling"])
+def schedule_exemptions(payload: ExemptionPreviewRequest):
+    """最小区域豁免预演：在可豁免现有区域的子集中找出让窗口内存在安全
+    出发时刻的最小豁免方案。
+
+    输入与 `/api/schedule` 相同的相对秒数固定行程（首点 `t=0`、其余严格
+    递增）与带时区候选出发窗口（左闭右开，服务端归一化到 UTC），另给：
+
+    * `candidate_region_ids`：**可豁免的互异现有区域编号**，编号必须存在、
+      不可重复；方案是它的一个子集，仅在本次预演中忽略被选区域；
+    * `expected_revision`：安全员已读区域 revision，与当前 revision 不符
+      返回 409 `revision_conflict`（details 带当前值）。
+
+    选优规则（依次比较）：① 豁免区域数最少；② 该方案下窗口内最早安全
+    出发时刻最早；③ 仍并列时按豁免编号升序序列的字典序取小。原本就安全
+    时豁免集为空。即使豁免全部候选区域仍无安全时刻时返回 200 且
+    `feasible=false`（无可行方案的明确结果，不是错误）。
+
+    预演为纯只读操作：整个计算在一个 `REPEATABLE READ READ ONLY` 事务中
+    使用**同一已提交区域快照**完成，不改变区域、凭证、承诺、观察、审计与
+    revision；既有核验与调度结果不受任何影响。
+    """
+    traj = geometry.validate_relative_trajectory(
+        payload.points, lambda p: (p.x, p.y), lambda p: p.t
+    )
+    if payload.window_start >= payload.window_end:
+        raise DomainError(
+            "候选出发窗口必须满足 window_start < window_end（左闭右开，起早于止）",
+            ["window_start", "window_end"],
+        )
+
+    candidate_ids = payload.candidate_region_ids
+    seen_ids: set[int] = set()
+    duplicates: list[int] = []
+    for rid in candidate_ids:
+        if rid in seen_ids and rid not in duplicates:
+            duplicates.append(rid)
+        seen_ids.add(rid)
+    if duplicates:
+        raise DuplicateExemptionRegion(sorted(duplicates))
+
+    window_start = payload.window_start.timestamp()
+    window_end = payload.window_end.timestamp()
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                revision, regions = repository.load_snapshot(cur)
+                if revision != payload.expected_revision:
+                    raise BatchRevisionConflict(payload.expected_revision, revision)
+                existing_ids = {r["id"] for r in regions}
+                missing = sorted(set(candidate_ids) - existing_ids)
+                if not missing:
+                    plan = exemptions.plan_minimum_exemptions(
+                        traj, regions, candidate_ids, window_start, window_end
+                    )
+            except Exception:
+                # 只读事务：任何失败（含 409 revision_conflict）都仅回滚快照
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    if missing:
+        raise StarletteHTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "code": "region_not_found",
+                    "message": "可豁免区域中存在不存在的区域编号",
+                    "details": [
+                        {"loc": ["candidate_region_ids"],
+                         "message": f"区域 {rid} 不存在",
+                         "region_id": rid}
+                        for rid in missing
+                    ],
+                }
+            },
+        )
+
+    out_intervals = [
+        {
+            "start": datetime.fromtimestamp(iv["start"], tz=timezone.utc),
+            "end": datetime.fromtimestamp(iv["end"], tz=timezone.utc),
+            "start_inclusive": iv["start_inclusive"],
+            "end_inclusive": iv["end_inclusive"],
+        }
+        for iv in plan["intervals"]
+    ]
+
+    return ExemptionPreviewResponse(
+        feasible=plan["feasible"],
+        revision=revision,
+        window_start=payload.window_start,
+        window_end=payload.window_end,
+        candidate_region_ids=candidate_ids,
+        exempt_region_ids=plan["exempt_region_ids"],
+        earliest_departure=(
+            datetime.fromtimestamp(plan["earliest_departure"], tz=timezone.utc)
+            if plan["earliest_departure"] is not None
+            else None
+        ),
+        intervals=out_intervals,
+    )
+
+
 @app.get("/health", tags=["meta"])
 def health():
     with db.pool.connection() as conn:
@@ -1245,6 +1378,7 @@ def root():
             "POST /api/regions/batch",
             "GET /api/regions/changes",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
+            "POST /api/schedule/exemptions",
             "POST /api/passes", "GET /api/passes/{id}",
             "POST /api/passes/{id}/cancel",
             "POST /api/commitments", "GET /api/commitments/{id}",

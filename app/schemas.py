@@ -289,6 +289,43 @@ class CommitmentIssueRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+class ExemptionPreviewRequest(BaseModel):
+    """最小区域豁免预演请求：相对秒数固定行程 + 带时区候选出发窗口。
+
+    在 candidate_region_ids（可豁免的互异现有区域编号）的子集中选取方案，
+    仅在本次预演中忽略被选区域，使窗口内至少存在一个安全出发时刻。
+    预演只读：不改变区域、revision、凭证、承诺、观察与审计。
+
+    expected_revision 为安全员已读区域 revision；与当前 revision 不符时
+    返回 409 revision_conflict。
+    """
+
+    points: list[RelativePointIn] = Field(min_length=2)
+    window_start: datetime = Field(description="候选出发窗口起点（含，带时区）")
+    window_end: datetime = Field(description="候选出发窗口终点（不含，带时区）")
+    candidate_region_ids: list[int] = Field(
+        min_length=1,
+        description="可豁免的互异现有区域编号；编号必须存在且不可重复（空集请求无意义）",
+    )
+    expected_revision: int = Field(
+        ge=0, description="安全员已读的区域全局 revision；过期返回 409 revision_conflict"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _check_time(cls, v: datetime, info):
+        return _require_utc(v, info.field_name)
+
+    @field_validator("candidate_region_ids")
+    @classmethod
+    def _check_candidates(cls, v: list[int]):
+        if any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in v):
+            raise ValueError("可豁免区域编号必须是不小于 1 的整数")
+        return v
+
+
 # ---------------------------------------------------------------- 响应模型
 
 def _iso_z(dt: datetime) -> str:
@@ -349,6 +386,24 @@ class ScheduleResponse(_UTCDatetimeModel):
     revision: int
     window_start: datetime
     window_end: datetime
+    intervals: list[DepartureIntervalOut]
+
+
+class ExemptionPreviewResponse(_UTCDatetimeModel):
+    """最小区域豁免预演结果。
+
+    feasible=false 表示即使豁免全部候选区域，窗口内仍无安全出发时刻
+    （HTTP 仍为 200：请求本身合法，只是无可行方案）。可行时给出
+    所据 revision、豁免编号（升序）、该方案最早安全时刻及其完整安全区间。
+    """
+
+    feasible: bool
+    revision: int
+    window_start: datetime
+    window_end: datetime
+    candidate_region_ids: list[int]
+    exempt_region_ids: list[int]
+    earliest_departure: datetime | None
     intervals: list[DepartureIntervalOut]
 
 

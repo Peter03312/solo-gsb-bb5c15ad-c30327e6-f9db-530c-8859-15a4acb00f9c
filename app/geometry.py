@@ -428,6 +428,29 @@ def forbidden_departure_intervals(
     return [(iv.start, iv.end) for iv in merged]
 
 
+def forbidden_departure_intervals_per_region(
+    traj: list[tuple[float, float, float]], regions: list[dict]
+) -> dict[int, list[tuple[float, float]]]:
+    """逐区域给出禁止出发区间（左闭右开，区间间相接/重叠已合并）。
+
+    与 forbidden_departure_intervals 使用完全相同的接触/生效规则，区别仅在
+    不做跨区域并集：最小区域豁免预演需要区分每个候选区域各自禁止了哪些
+    出发时刻。返回 {region_id: [(lo, hi), ...]}。
+    """
+    out: dict[int, list[tuple[float, float]]] = {}
+    for region in regions:
+        vf = region["valid_from"]
+        vt = region["valid_to"]
+        raw: list[EpochInterval] = []
+        for a, b in contact_intervals_relative(traj, region["polygon"]):
+            lo, hi = vf - b, vt - a
+            if hi - lo > EPS:
+                raw.append(EpochInterval(lo, hi))
+        merged = merge_intervals(raw)
+        out[region["id"]] = [(iv.start, iv.end) for iv in merged]
+    return out
+
+
 def safe_departure_intervals(
     traj: list[tuple[float, float, float]],
     regions: list[dict],

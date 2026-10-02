@@ -62,6 +62,44 @@ def main() -> None:
         lb = "[" if iv["start_inclusive"] else "("
         rb = "]" if iv["end_inclusive"] else ")"
         print(f"  可出发：{lb}{iv['start']}, {iv['end']}{rb}")
+
+    # ---- 最小区域豁免只读预演 ----
+    # 登记两个长期生效、都会压住该行程的区域；预演不改任何数据。
+    ex_a = call("POST", "/api/regions", {
+        "name": "豁免演示-A区",
+        "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": "2032-01-01T00:00:00Z",
+    })
+    ex_b = call("POST", "/api/regions", {
+        "name": "豁免演示-B区",
+        "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": "2032-01-01T00:00:00Z",
+    })
+    id_a, id_b = ex_a["region"]["id"], ex_b["region"]["id"]
+    ex_revision = call("GET", "/api/revision")["revision"]
+    ex_payload = {
+        "points": [
+            {"x": -50, "y": 50, "t": 0},
+            {"x": 150, "y": 50, "t": 60},
+        ],
+        "window_start": "2030-06-01T10:00:00Z",
+        "window_end": "2030-06-01T12:00:00Z",
+        "candidate_region_ids": [id_a, id_b],
+        "expected_revision": ex_revision,
+    }
+    # 只豁免 A：B 仍封锁 → feasible=false；两个都豁免 → 整窗安全
+    only_a = dict(ex_payload, candidate_region_ids=[id_a])
+    show("豁免预演（只豁免 A，B 仍封锁）：feasible=false",
+         call("POST", "/api/schedule/exemptions", only_a))
+    plan = call("POST", "/api/schedule/exemptions", ex_payload)
+    show("豁免预演（A、B 均可豁免）：最小豁免方案", plan)
+    print(f"  豁免编号：{plan['exempt_region_ids']}；"
+          f"最早安全出发：{plan['earliest_departure']}")
+    call("DELETE", f"/api/regions/{id_a}")
+    call("DELETE", f"/api/regions/{id_b}")
+
     call("DELETE", f"/api/regions/{window_region['region']['id']}")
 
     # ---- 区域登记 + 轨迹穿越核验 ----
